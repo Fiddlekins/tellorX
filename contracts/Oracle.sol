@@ -22,6 +22,9 @@ contract Oracle is TellorVars {
     mapping(address => uint256) reporterLastTimestamp; // mapping of reporter addresses to the timestamp of their last reported value
     mapping(address => uint256) reportsSubmittedByAddress; // mapping of reporter addresses to the number of reports they've submitted
     mapping(address => uint256) tipsByUser; // mapping of a user to the amount of tips they've paid
+    bytes public lastNewValue; // The last value submitted across all feeds
+    uint256 public targetDecayDuration = 5 minutes; // amount of time before all reporters are eligible to submit to a feed after it got tipped
+    uint256 public minStakedBlockCount = 5 minutes / 13 seconds; // decay duration divided by current average block rate
 
     // Structs
     struct Report {
@@ -30,6 +33,8 @@ contract Oracle is TellorVars {
         mapping(uint256 => uint256) timestampToBlockNum; // mapping described by [apiId][minedTimestamp]=>block.number
         mapping(uint256 => bytes) valueByTimestamp; // mapping of timestamps to values
         mapping(uint256 => address) reporterByTimestamp; // mapping of timestamps to reporters
+        uint256 target; // The current target
+        uint256 lastTargetTimestamp; // Timestamp of the last time a tip triggered a new target
     }
 
     // Events
@@ -79,6 +84,13 @@ contract Oracle is TellorVars {
         tips[_id] += _tip;
         tipsByUser[msg.sender] += _tip;
         tipsInContract += _tip;
+        // Update target if appropriate
+        Report storage rep = reports[_id];
+        // Don't update target if an existing target has yet to fully decay to prevent censor attacks
+        if ((rep.lastTargetTimestamp + targetDecayDuration) < block.timestamp){
+            rep.lastTargetTimestamp = block.timestamp;
+            rep.target = uint256(keccak256(abi.encodePacked(block.timestamp, lastNewValue)));
+        }
         emit TipAdded(msg.sender, _id, _tip, tips[_id], _data);
     }
 
@@ -173,6 +185,33 @@ contract Oracle is TellorVars {
             rep.reporterByTimestamp[block.timestamp] == address(0),
             "timestamp already reported for"
         );
+        uint256 _elapsedTime = block.timestamp - rep.lastTargetTimestamp;
+        // skip if lastTargetTimestamp is in resting state or target has fully decayed
+        if (rep.lastTargetTimestamp > 0 && _elapsedTime < targetDecayDuration){
+            // Prevent automatic generation of new address that is eligible sooner by requiring an address to have been staked (roughly) before the target was set
+            require(
+                _tellor.balanceOfAt(msg.sender,block.number - minStakedBlockCount) >= _tellor.uints(_STAKE_AMOUNT),
+                "balance must been greater than stake amount before target was set"
+            );
+            // Calculate eligibility
+            uint256 _eligibility = uint256(keccak256(abi.encodePacked(rep.lastTargetTimestamp, msg.sender)));
+            uint256 _smaller = rep.target > _eligibility ? _eligibility : rep.target;
+            uint256 _larger = rep.target > _eligibility ? rep.target : _eligibility ;
+            uint256 _distance = _larger - _smaller;
+            uint256 _maxUint256 = uint256(-1);
+            // if _distance is greater than half the range of a unit256 then wrapping around is closer
+            if (_distance > (_maxUint256/2)){
+                _distance = _smaller + (_maxUint256 - _larger);
+            }
+            // _distance / _maxUint256 must be less than _elapsedTime / targetDecayDuration for this report attempt to eligible
+            require(
+                _distance <= ((_maxUint256/targetDecayDuration) * _elapsedTime),
+                "reporter address not yet eligible to submit"
+            );
+            // Set back to 0 so that we can skip this work until a new tip sets a target again
+            rep.lastTargetTimestamp = 0;
+        }
+
         // Update number of timestamps, value for given timestamp, and reporter for timestamp
         rep.timestampIndex[block.timestamp] = rep.timestamps.length;
         rep.timestamps.push(block.timestamp);
@@ -189,6 +228,7 @@ contract Oracle is TellorVars {
         // Update last oracle value and number of values submitted by a reporter
         timeOfLastNewValue = block.timestamp;
         reportsSubmittedByAddress[msg.sender]++;
+        lastNewValue = _value;
         emit NewReport(_id, block.timestamp, _value, _tip + _reward);
     }
 
@@ -267,6 +307,20 @@ contract Oracle is TellorVars {
         returns (uint256)
     {
         return reportsSubmittedByAddress[_reporter];
+    }
+
+    /**
+     * @dev Returns the data the reporter client requires to determine when it's eligible to submit a value following a tip
+     * @param _id is ID of the specific data feed
+     * @return uint256 of the number of the current target and uint256 of the corresponding timestamp for the inputted data ID
+     */
+    function getTargetData(bytes _id)
+        external
+        view
+        returns (uint256, uint256)
+    {
+        Report storage rep = reports[_id];
+        return (rep.target, rep.lastTargetTimestamp);
     }
 
     /**
