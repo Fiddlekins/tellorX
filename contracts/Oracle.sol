@@ -203,9 +203,10 @@ contract Oracle is TellorVars {
             if (_distance > (_maxUint256/2)){
                 _distance = _smaller + (_maxUint256 - _larger);
             }
-            // _distance / _maxUint256 must be less than _elapsedTime / targetDecayDuration for this report attempt to eligible
+            // _distance has range [0,_maxUint256/2)
+            // _distance / (_maxUint256/2) must be less than _elapsedTime / targetDecayDuration for this report attempt to eligible
             require(
-                _distance <= ((_maxUint256/targetDecayDuration) * _elapsedTime),
+                _distance <= (((_maxUint256/2)/targetDecayDuration) * _elapsedTime),
                 "reporter address not yet eligible to submit"
             );
             // Set back to 0 so that we can skip this work until a new tip sets a target again
